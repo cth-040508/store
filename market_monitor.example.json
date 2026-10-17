@@ -1,0 +1,26 @@
+{
+  "feeds": [
+    {
+      "name": "CNBC Finance",
+      "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+      "category": "美股与金融"
+    },
+    {
+      "name": "CoinDesk",
+      "url": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+      "category": "加密资产"
+    },
+    {
+      "name": "Federal Reserve",
+      "url": "https://www.federalreserve.gov/feeds/press_all.xml",
+      "category": "美联储"
+    },
+    {
+      "name": "SEC Press Releases",
+      "url": "https://www.sec.gov/news/pressreleases.rss",
+      "category": "监管公告"
+    }
+  ],
+  "max_items": 12,
+  "lookback_hours": 36
+}
