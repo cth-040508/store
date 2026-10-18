@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -33,11 +34,11 @@ ATOM = "http://www.w3.org/2005/Atom"
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        return {"feeds": FEEDS, "max_items": 12, "lookback_hours": 36}
+        return {"feeds": FEEDS, "max_items": 5, "lookback_hours": 36}
     with CONFIG_PATH.open("r", encoding="utf-8") as stream:
         config = json.load(stream)
     config.setdefault("feeds", FEEDS)
-    config.setdefault("max_items", 12)
+    config.setdefault("max_items", 5)
     config.setdefault("lookback_hours", 36)
     return config
 
@@ -100,8 +101,64 @@ def fetch_feed(feed: dict) -> list[dict]:
     return items
 
 
+def assess_importance(item: dict) -> tuple[int, str]:
+    """Conservative headline rules; a source alone never qualifies an article."""
+    title = item["title"].lower()
+    def has(pattern: str) -> bool:
+        return bool(re.search(pattern, title, re.I))
+
+    if has(r"\b(sponsored|paid post|price prediction|technical analysis|opinion|horoscope|best .* to buy|could .* reach|what to watch|preview|week ahead)\b"):
+        return 0, "预测、评论或推广"
+    if has(r"\b(expects?|predicts?|forecasts?|bets? on|could|may|might|eyes|weighs|considers)\b"):
+        return 0, "尚未落地的预测或讨论"
+
+    if has(r"\b(fed|fomc|federal reserve|ecb|bank of japan|bank of england|pboc)\b") and has(r"\b(cuts?|raises?|holds?|keeps?|hikes?|decision|statement|minutes|quantitative|emergency)\b"):
+        return 100, "主要央行政策与会议结果"
+    if has(r"\b(cpi|pce|nonfarm|non-farm|payrolls|inflation|gdp|unemployment)\b") and has(r"\b(u\.?s\.?|america|payrolls|nonfarm|non-farm)\b") and has(r"\b(rises?|falls?|rose|fell|increases?|decreases?|hits?|slows?|cools?|accelerates?|report|data|released|grew|shrinks?)\b"):
+        return 95, "美国关键经济数据"
+    if has(r"\b(tariffs?|sanctions?|trade deal|war|invasion|strait of hormuz)\b") and has(r"\b(announces?|imposes?|signs?|launches?|blocks?|closes?|escalates?|strikes?|agrees?|halts?)\b"):
+        return 90, "重大贸易或地缘事件"
+
+    crypto = has(r"\b(bitcoin|btc|ethereum|ether|eth|crypto|stablecoin|usdt|usdc|tether|binance|coinbase|kraken|defi|solana)\b")
+    if crypto and has(r"\b(hack(?:ed)?|exploit(?:ed)?|breach|stolen|depeg(?:s|ged)?|bankruptcy|bankrupt|insolven\w*|halts? withdrawals|suspends? withdrawals)\b"):
+        return 90, "加密安全或偿付风险"
+    if crypto and has(r"\b(sec|cftc|congress|senate|court|regulator\w*|etf|law|bill)\b") and has(r"\b(approves?|rejects?|denies|bans?|passes?|signs?|rules?|ruling|sues?|charges?|settles?|settlement)\b"):
+        return 85, "加密监管、法律或 ETF 决定"
+
+    if has(r"\b(apple|microsoft|nvidia|amazon|alphabet|google|meta|tesla|broadcom|tsmc|jpmorgan|berkshire)\b") and has(r"\b(earnings|results|guidance|outlook|revenue|profit|acquires?|acquisition|antitrust)\b"):
+        return 80, "重点公司业绩或重大经营事件"
+    if has(r"\b(bank|banking|treasury|bond market|stock exchange|nyse|nasdaq)\b") and has(r"\b(failure|fails|collapse|bailout|emergency|default|outage|shutdown)\b"):
+        return 90, "金融系统或交易中断风险"
+    return 0, "未命中重大事件规则"
+
+
+def title_key(title: str) -> str:
+    return " ".join(re.findall(r"\w+", title.lower()))
+
+
+def filter_important(items: list[dict], recent_titles: list[str]) -> list[dict]:
+    ranked = []
+    for item in items:
+        score, reason = assess_importance(item)
+        if score:
+            ranked.append({**item, "importance": score, "reason": reason})
+    ranked.sort(key=lambda item: (item["importance"], item["published"] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    keys = [title_key(title) for title in recent_titles]
+    selected = []
+    urls = set()
+    for item in ranked:
+        key = title_key(item["title"])
+        if item["link"] in urls or any(SequenceMatcher(None, key, other).ratio() >= 0.85 for other in keys):
+            continue
+        selected.append(item)
+        keys.append(key)
+        urls.add(item["link"])
+    return selected
+
+
 def init_state(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE TABLE IF NOT EXISTS sent_items (url TEXT PRIMARY KEY, sent_at TEXT NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS sent_headlines (title TEXT NOT NULL, sent_at TEXT NOT NULL)")
     connection.commit()
 
 
@@ -136,6 +193,7 @@ def format_digest(items: list[dict]) -> str:
         lines.extend([
             f"【{item['category']}】{item['title']}",
             f"来源：{item['source']} | {when}",
+            f"入选原因：{item['reason']}",
             item["link"],
             "",
         ])
@@ -174,9 +232,12 @@ def main() -> int:
     with sqlite3.connect(STATE_PATH) as connection:
         init_state(connection)
         fresh = select_new_items(connection, all_items, int(config["lookback_hours"]))
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=36)).isoformat()
+        recent_titles = [row[0] for row in connection.execute("SELECT title FROM sent_headlines WHERE sent_at >= ?", (cutoff,))]
+        fresh = filter_important(fresh, recent_titles)
         fresh = fresh[:max(1, int(config["max_items"]))]
         if not fresh:
-            print(f"没有新消息。成功读取 {len(config['feeds']) - len(failures)}/{len(config['feeds'])} 个来源。")
+            print(f"没有符合重点筛选规则的新消息。成功读取 {len(config['feeds']) - len(failures)}/{len(config['feeds'])} 个来源。")
             if failures:
                 print("来源异常：" + "；".join(failures), file=sys.stderr)
             return 0
@@ -187,6 +248,8 @@ def main() -> int:
             return 1
         sent_at = datetime.now(timezone.utc).isoformat()
         connection.executemany("INSERT OR IGNORE INTO sent_items(url, sent_at) VALUES (?, ?)", [(item["link"], sent_at) for item in fresh])
+        connection.executemany("INSERT INTO sent_headlines(title, sent_at) VALUES (?, ?)", [(item["title"], sent_at) for item in fresh])
+        connection.execute("DELETE FROM sent_headlines WHERE sent_at < ?", (cutoff,))
         connection.commit()
 
     print(f"已推送 {len(fresh)} 条新消息。")
